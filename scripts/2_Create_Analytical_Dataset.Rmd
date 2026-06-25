@@ -1,0 +1,491 @@
+---
+title: "2 — Build Analytical Dataset"
+author: "Pablo Knobel"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+---
+
+# Summary
+
+Builds the analytical dataset for the bird biodiversity and frailty analysis.
+Starting from the MSDW primary care cohort, the pipeline:
+
+1. Loads patient demographics and derived VAFI frailty scores
+2. Links patients to census tracts via geocoded addresses (time-varying)
+3. Joins tract-level ACS socioeconomic variables (time-varying, annual)
+4. Joins latent Shannon diversity estimates from the eBird GAM (time-varying, annual)
+5. Merges encounter records and applies two-consecutive-year trimming,
+   with death records protected from premature censoring
+6. Removes post-death observations
+7. Derives age, binary frailty, and IQR-scaled Shannon exposure
+8. Runs validation checks and saves
+
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(readr)
+library(janitor)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(sf)
+library(tidycensus)
+```
+
+```{r parameters}
+# --- Paths ---
+wd <- "C:/Users/knobep01/OneDrive - The Mount Sinai Hospital"
+
+path_patient   <- file.path(wd, "Maayans lab", "Outcome data", "MSDW 2024 data", "Original files", "PATIENT.csv")
+path_encounter <- file.path(wd, "Maayans lab", "Outcome data", "MSDW 2024 data", "Original files", "ENCOUNTER.csv")
+path_geocodes  <- file.path(wd, "Maayans lab", "Helena",
+                            "MSDW PC patients 2011-2023",
+                            "generated files", "Shapefiles and goecodes",
+                            "Geocodes", "final addresses dates.rds")
+path_vafi      <- file.path(wd, "Knobel Lab", "Birds and Brains", "Birds Frailty - NYC", "vafi_results.rds")
+path_shannon   <- file.path(wd, "Non PHI Data", "eBird",
+                            "_derived_tract_year_shannon_2010_2024",
+                            "nyc_tract_year_latent_shannon.rds")
+path_output    <- file.path(wd, "Knobel Lab", "Birds and Brains", "Birds Frailty - NYC",
+                            paste0("Birds_Frailty_Analytical_Dataset_",
+                                   format(Sys.Date(), "%Y%m%d"), ".rds"))
+
+# --- Study parameters ---
+study_year_min  <- 2011L
+study_year_max  <- 2023L
+acs_states      <- c("NY", "NJ", "CT")
+acs_years       <- 2010:2023
+census_api_key("c0a3624f34fb76482a64d7077d775860c5a87d98",
+               install = TRUE, overwrite = TRUE)
+options(tigris_use_cache = TRUE)
+```
+
+---
+
+# Load Patient Demographics
+
+Null-like strings are recoded to `NA`. Two death-date sources are available
+(Epic EHR and SSDI); the earlier of the two is used when both are present.
+
+```{r load-patients}
+patient_raw <- read_csv(path_patient, show_col_types = FALSE) %>%
+  clean_names()
+
+patient <- patient_raw %>%
+  mutate(
+    across(
+      where(is.character),
+      ~ replace(.x, .x %in% c("NULL", "Unknown", "PATIENT DECLINED", "(null)"),
+                NA_character_)
+    ),
+    dob                = ymd(dob),
+    deceased_date_epic = as.Date(deceased_date_epic, format = "%Y-%m-%d"),
+    deceased_date_ssdi = as.Date(deceased_date_ssdi, format = "%Y-%m-%d"),
+    deceased_date      = coalesce(deceased_date_epic, deceased_date_ssdi)
+  ) %>%
+  select(mrn, dob, sex, race, insurance, deceased_date)
+
+cat("Patients loaded:", nrow(patient), "\n")
+cat("Deceased       :", sum(!is.na(patient$deceased_date)), "\n")
+```
+
+---
+
+# Load VAFI Frailty Scores
+
+```{r load-vafi}
+vafi <- readRDS(path_vafi) %>%
+  rename(
+    mrn  = PatientICN,
+    year = IndexDate
+  ) %>%
+  select(mrn, year, vafi, deficit_count)
+
+cat("VAFI rows          :", nrow(vafi), "\n")
+cat("Unique patients    :", n_distinct(vafi$mrn), "\n")
+cat("Years covered      :", min(vafi$year), "-", max(vafi$year), "\n")
+```
+
+---
+
+# Load and Summarise Encounters
+
+A patient × year grid is constructed from raw encounters. A `had_encounter`
+flag (0/1) records whether the patient had any contact with primary care that
+year. The full study-year range is completed so gaps are explicit zeros.
+
+```{r load-encounters}
+enc_raw <- read_csv(path_encounter, show_col_types = FALSE) %>%
+  clean_names() %>%
+  rename(mrn = primary_mrn)
+
+enc_annual <- enc_raw %>%
+  filter(!is.na(enc_start_date)) %>%
+  mutate(year = as.integer(year(enc_start_date))) %>%
+  group_by(mrn, year) %>%
+  summarise(
+    encounters    = n(),
+    had_encounter = as.integer(encounters > 0L),
+    .groups       = "drop"
+  )
+
+enc_grid <- enc_annual %>%
+  complete(
+    mrn,
+    year = study_year_min:study_year_max,
+    fill = list(encounters = 0L, had_encounter = 0L)
+  ) %>%
+  arrange(mrn, year)
+
+rm(enc_raw, enc_annual)
+cat("Encounter-grid rows:", nrow(enc_grid), "\n")
+```
+
+---
+
+# Tract Linkage
+
+## Geocodes → Census Tract GEOIDs
+
+Patients' geocoded addresses are spatially joined to 2020 census tract
+boundaries for NY, NJ, and CT. An erroneous start date of 2010-01-01 in the
+source file is corrected to 2009-01-01.
+
+```{r geocode-to-tract}
+geocodes_raw <- readRDS(path_geocodes)
+geocodes_raw$first_year[geocodes_raw$first_year == 2010L] <- 2009L
+
+tracts_tri <- map_dfr(
+  acs_states,
+  ~ get_acs(
+    geography   = "tract",
+    variables   = "B01001_001",
+    state       = .x,
+    year        = 2020,
+    geometry    = TRUE,
+    cache_table = TRUE
+  ) %>%
+    select(GEOID, geometry)
+)
+
+geocodes_sf <- st_as_sf(geocodes_raw, coords = c("x", "y"), crs = 4326) %>%
+  st_transform(st_crs(tracts_tri))
+
+addr_with_tract <- st_join(
+  geocodes_sf,
+  tracts_tri["GEOID"],
+  join = st_within,
+  left = TRUE
+) %>%
+  st_drop_geometry()
+
+cat("Addresses with tract GEOID:",
+    sum(!is.na(addr_with_tract$GEOID)), "/", nrow(addr_with_tract), "\n")
+```
+
+## Expand to Patient × Year
+
+Each address record carries a valid date range. It is expanded so that each
+patient-year is assigned the GEOID corresponding to where the patient lived
+that year. Where a patient moved within a year, the most recent address is
+kept.
+
+```{r expand-addresses}
+# Correct erroneous 2010 start years to 2009 (also present in the expanded form)
+addr_with_tract$first_year <- ifelse(
+  addr_with_tract$first_year == 2010L,
+  2009L,
+  addr_with_tract$first_year
+)
+
+addr_expanded <- addr_with_tract %>%
+  mutate(year_range = map2(first_year, last_year, seq)) %>%
+  unnest(year_range) %>%
+  rename(year = year_range) %>%
+  filter(year >= study_year_min, year <= study_year_max) %>%
+  distinct(MRN, year, .keep_all = TRUE) %>%
+  rename(mrn = MRN)
+
+cat("Address-year rows:", nrow(addr_expanded), "\n")
+print(table(addr_expanded$year))
+```
+
+## Join ACS Socioeconomic Variables (Time-Varying)
+
+Poverty count, Hispanic population, and non-Hispanic Black population are
+fetched from ACS 5-year estimates for each year from 2010–2023 and converted
+to percentages of tract population.
+
+```{r join-acs}
+acs_variables <- c(
+  pov              = "B17001_002",
+  hispanic         = "B03002_012",
+  nhblack          = "B03002_004",
+  total_population = "B01003_001"
+)
+
+get_tract_acs <- function(y, st) {
+  message("Fetching ACS: state = ", st, ", year = ", y)
+  get_acs(
+    geography   = "tract",
+    variables   = acs_variables,
+    year        = y,
+    survey      = "acs5",
+    state       = st,
+    output      = "wide"
+  ) %>%
+    mutate(year = y, state = st)
+}
+
+tract_acs_raw <- map_dfr(
+  acs_years,
+  ~ {
+    y <- .x
+    map_dfr(acs_states, ~ get_tract_acs(y, .x))
+  }
+)
+
+ses <- tract_acs_raw %>%
+  transmute(
+    GEOID,
+    year,
+    pov_pct      = 100 * povE      / total_populationE,
+    hispanic_pct = 100 * hispanicE / total_populationE,
+    nhblack_pct  = 100 * nhblackE  / total_populationE
+  )
+
+addr_with_ses <- addr_expanded %>%
+  left_join(ses, by = c("GEOID", "year"))
+
+cat("Missing pov_pct after ACS join:",
+    sum(is.na(addr_with_ses$pov_pct)), "\n")
+```
+
+## Join Latent Shannon Exposure (Time-Varying)
+
+Shannon diversity estimates are from the `mgcv::bam()` Gamma GAM fitted in
+the eBird pipeline (`nyc_ebird_biodiversity.Rmd`). The dataset contains one
+row per GEOID × year (2010–2024) with a latent Shannon estimate and its
+prediction standard error.
+
+```{r join-shannon}
+shannon_latent <- readRDS(path_shannon) %>%
+  transmute(
+    GEOID           = as.character(GEOID),
+    year            = as.integer(year),
+    shannon_pred    = shannon_pred,
+    shannon_pred_se = shannon_pred_se,
+    shannon_weight  = shannon_weight
+  )
+
+addr_with_shannon <- addr_with_ses %>%
+  left_join(shannon_latent, by = c("GEOID", "year"))
+
+cat("Shannon coverage (% tract-years with prediction):",
+    round(mean(!is.na(addr_with_shannon$shannon_pred)) * 100, 1), "%\n")
+print(summary(addr_with_shannon$shannon_pred))
+```
+
+---
+
+# Merge All Sources
+
+```{r merge-all}
+merged <- addr_with_shannon %>%
+  left_join(vafi,    by = c("mrn", "year")) %>%
+  left_join(enc_grid, by = c("mrn", "year")) %>%
+  left_join(patient,  by = "mrn")
+
+# Flag patients with multiple addresses in the same year
+dup_mrn_year <- merged %>%
+  count(mrn, year) %>%
+  filter(n > 1L)
+
+cat("Duplicate mrn-year rows (address changers):", nrow(dup_mrn_year), "\n")
+cat("Merged rows:", nrow(merged), "\n")
+```
+
+---
+
+# Trimming: Two Consecutive Years Without Encounters
+
+Patients are censored at the start of their first two-consecutive-year gap
+in healthcare utilisation. Gaps likely indicate disengagement from care rather
+than true follow-up, and retaining them could bias longitudinal estimates.
+
+> **Important:** death records are protected from trimming. If a patient dies
+> after a two-year gap, the trimming cutoff is extended to include their death
+> year so that the death is not silently discarded.
+
+```{r trim-encounters}
+df_trimmed <- merged %>%
+  filter(year >= study_year_min) %>%
+  arrange(mrn, year) %>%
+  group_by(mrn) %>%
+  mutate(
+    he              = replace_na(as.integer(had_encounter), 0L),
+    zero_pair_start = he == 0L & lead(he, default = 1L) == 0L,
+    cutoff_pos      = if (any(zero_pair_start)) min(which(zero_pair_start)) else Inf,
+    row_num         = row_number()
+  ) %>%
+  filter(row_num < cutoff_pos) %>%
+  ungroup() %>%
+  select(-he, -zero_pair_start, -cutoff_pos, -row_num)
+
+cat("Rows after encounter trimming:", nrow(df_trimmed), "\n")
+```
+
+---
+
+# Remove Post-Death Observations
+
+```{r remove-post-death}
+df_alive <- df_trimmed %>%
+  mutate(
+    death_year_obs = as.integer(format(as.Date(deceased_date), "%Y"))
+  ) %>%
+  filter(is.na(death_year_obs) | year <= death_year_obs) %>%
+  select(-death_year_obs)
+
+cat("Rows after removing post-death observations:", nrow(df_alive), "\n")
+```
+
+---
+
+# Derive Analysis Variables
+
+```{r derive-variables}
+shannon_iqr <- IQR(df_alive$shannon_pred, na.rm = TRUE)
+
+df_alive <- df_alive %>%
+  mutate(
+    age             = year - year(dob),
+    vafi_bi         = as.integer(!is.na(vafi) & vafi > 0.2),
+    shannon_pred_iqr = shannon_pred / shannon_iqr,
+    race_collapsed  = case_when(
+      race %in% c("White", "WHITE")                  ~ "White",
+      race %in% c("Black or African American",
+                  "BLACK OR AFRICAN AMERICAN")        ~ "Black",
+      race %in% c("Asian", "ASIAN")                  ~ "Asian",
+      race %in% c("Hispanic", "HISPANIC OR LATINO")  ~ "Hispanic",
+      TRUE                                            ~ "Other/Unknown"
+    ),
+    race_collapsed     = factor(race_collapsed,
+                                levels = c("White", "Black", "Asian",
+                                           "Hispanic", "Other/Unknown")),
+    insurance_collapsed = case_when(
+      grepl("Medicare",  insurance, ignore.case = TRUE) ~ "Medicare",
+      grepl("Medicaid",  insurance, ignore.case = TRUE) ~ "Medicaid",
+      grepl("Commercial|Private", insurance,
+            ignore.case = TRUE)                         ~ "Commercial",
+      TRUE                                              ~ "Other/Unknown"
+    ),
+    insurance_collapsed = factor(insurance_collapsed,
+                                 levels = c("Commercial", "Medicare",
+                                            "Medicaid", "Other/Unknown"))
+  )
+
+cat("IQR of shannon_pred used for scaling:", round(shannon_iqr, 3), "\n")
+```
+
+---
+
+# Validation
+
+```{r validate}
+cat("\n========== SANITY CHECKS ==========\n")
+
+cat("\n-- Coverage --\n")
+cat("Total rows          :", nrow(df_alive), "\n")
+cat("Unique patients     :", n_distinct(df_alive$mrn), "\n")
+cat("Years covered       :", min(df_alive$year), "-", max(df_alive$year), "\n")
+cat("Rows per year:\n")
+print(table(df_alive$year))
+
+cat("\n-- Shannon Exposure --\n")
+cat("Missing shannon_pred      :", sum(is.na(df_alive$shannon_pred)),
+    sprintf("(%.1f%%)", mean(is.na(df_alive$shannon_pred)) * 100), "\n")
+cat("Missing shannon_pred_se   :", sum(is.na(df_alive$shannon_pred_se)), "\n")
+cat("Missing shannon_weight    :", sum(is.na(df_alive$shannon_weight)), "\n")
+cat("Negative shannon_pred     :", sum(df_alive$shannon_pred < 0, na.rm = TRUE), "\n")
+cat("Shannon range             :",
+    round(min(df_alive$shannon_pred, na.rm = TRUE), 2), "-",
+    round(max(df_alive$shannon_pred, na.rm = TRUE), 2), "\n")
+
+cat("\n-- Frailty (VAFI) --\n")
+cat("Missing vafi              :", sum(is.na(df_alive$vafi)),
+    sprintf("(%.1f%%)", mean(is.na(df_alive$vafi)) * 100), "\n")
+cat("vafi_bi distribution:\n")
+print(table(df_alive$vafi_bi, useNA = "always"))
+
+cat("\n-- Covariates --\n")
+cat("Missing age               :", sum(is.na(df_alive$age)),   "\n")
+cat("Missing sex               :", sum(is.na(df_alive$sex)),   "\n")
+cat("Missing race_collapsed    :", sum(is.na(df_alive$race_collapsed)), "\n")
+cat("Missing insurance_collapsed:", sum(is.na(df_alive$insurance_collapsed)), "\n")
+cat("Missing pov_pct           :", sum(is.na(df_alive$pov_pct)), "\n")
+cat("Missing nhblack_pct       :", sum(is.na(df_alive$nhblack_pct)), "\n")
+
+cat("\n-- Death Consistency --\n")
+post_death_check <- df_alive %>%
+  mutate(death_yr = as.integer(format(as.Date(deceased_date), "%Y"))) %>%
+  filter(!is.na(death_yr), year > death_yr)
+cat("Post-death rows (must be 0):", nrow(post_death_check), "\n")
+
+cat("\n-- Encounter Trimming --\n")
+gap_check <- df_alive %>%
+  arrange(mrn, year) %>%
+  group_by(mrn) %>%
+  mutate(
+    he              = replace_na(as.integer(had_encounter), 0L),
+    death_yr        = as.integer(format(as.Date(deceased_date), "%Y")),
+    zero_pair_start = he == 0L & lead(he, default = 1L) == 0L
+  ) %>%
+  summarise(has_gap = any(zero_pair_start), .groups = "drop")
+
+cat("\n-- Spatial --\n")
+cat("Missing GEOID             :", sum(is.na(df_alive$GEOID)), "\n")
+cat("Unique GEOIDs             :", n_distinct(df_alive$GEOID), "\n")
+
+cat("\n====================================\n")
+
+stopifnot(
+  "No post-death rows"              = nrow(post_death_check) == 0L,
+  "No remaining encounter gaps"     = sum(gap_check$has_gap) == 0L
+)
+cat("All checks passed.\n")
+```
+
+---
+
+# Save
+
+```{r save}
+saveRDS(df_alive, path_output)
+
+cat("Saved  :", path_output, "\n")
+cat("Rows   :", nrow(df_alive), "\n")
+cat("Unique patients:", n_distinct(df_alive$mrn), "\n")
+cat("Years  :", min(df_alive$year), "-", max(df_alive$year), "\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

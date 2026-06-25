@@ -1,0 +1,405 @@
+---
+title: "1 — Calculate VAFI Frailty Scores"
+author: "Pablo Knobel"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+---
+
+# Summary
+
+This script calculates the Veterans Affairs Frailty Index (VAFI) for all
+patients in the Mount Sinai primary care cohort. For each patient × year
+combination (2011–2023), it counts how many of the 31 VAFI deficits are
+present in the `year_prior` years before the index year, using ICD-10
+diagnosis codes and CPT procedure codes as evidence. The output is a
+wide-format dataset with one row per patient × year containing the VAFI
+score, the deficit count, and binary deficit indicators.
+
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(janitor)
+library(lubridate)
+library(stringr)
+library(arrow)
+library(tidyr)
+library(zoo)
+library(ggplot2)
+library(fst)
+library(pbapply)
+library(reshape2)
+```
+
+```{r parameters}
+# --- Paths ---
+wd              <- "C:/Users/knobep01/OneDrive - The Mount Sinai Hospital"
+path_patient    <- file.path(wd, "Maayans lab", "Outcome data", "MSDW 2024 data", "Original files", "PATIENT.csv")
+path_diagnosis  <- file.path(wd, "Maayans lab", "Outcome data","MSDW 2024 data", "Original files", "DIAGNOSIS.csv")
+path_procedures <- file.path(wd, "Maayans lab", "Outcome data","MSDW 2024 data", "Original files", "IMPRESSION NOTES.csv")
+path_icd_map  <- here::here("VA-FI Mappings", "icd_code_vafi_mapping.fst")
+path_prcd_map <- here::here("VA-FI Mappings", "procedure_code_vafi_mapping.fst")
+path_output     <- file.path(wd, "Knobel Lab", "Birds and Brains", "Birds Frailty - NYC", "vafi_results.rds")
+
+# --- Study parameters ---
+study_years <- 2011:2023   # Index years for VAFI calculation
+year_prior  <- 3L           # Years of lookback window for deficit ascertainment
+chunk_size  <- 1e6          # Rows per processing chunk (memory management)
+
+# --- VAFI deficit columns
+# Derive deficit list from mapping files (single source of truth)
+cols_deficit <- union(
+  fst::read.fst(path_icd_map)$Deficit,
+  fst::read.fst(path_prcd_map)$Deficit
+) %>% sort()
+
+length(cols_deficit)  
+```
+
+---
+
+# Helper Functions
+
+The two internal functions below handle the ICD-9/ICD-10 switchover and the
+chunked deficit ascertainment. They are defined here so the main `make_vafi()`
+call in the next section is self-contained.
+
+```{r functions}
+# Filter ICD codes to respect the ICD-9 → ICD-10 switchover on 2015-10-01.
+# Working at year resolution: ICD-9 codes are retained only before 2015;
+# ICD-10 codes are retained from 2015 onward; CPT codes are always retained.
+.filter_icd_cutoff_years <- function(icd_df) {
+  switchover_year <- 2015L
+  icd_df %>%
+    filter(
+      (grepl("ICD9",  CodeType) & Date <  switchover_year) |
+      (grepl("ICD10", CodeType) & Date >= switchover_year) |
+       CodeType == "CPT"
+    )
+}
+
+# For a chunk of claim rows, join to the index-date grid, keep only rows
+# within the lookback window, then map codes to named deficits.
+.make_deficit_chunk_years <- function(chunk_size, icd_df,
+                                      year_prior, index_date_tb, mapping) {
+  n <- nrow(icd_df)
+  pblapply(seq(1, n, by = chunk_size), function(i_lo) {
+    i_hi <- min(i_lo + chunk_size - 1L, n)
+    icd_df[i_lo:i_hi, ] %>%
+      inner_join(
+        index_date_tb %>% select(PatientICN, IndexDate),
+        by = "PatientICN"
+      ) %>%
+      mutate(
+        Date        = as.numeric(Date),
+        IndexDate   = as.numeric(IndexDate),
+        date_to_idx = IndexDate - Date
+      ) %>%
+      filter(IndexDate >= Date, date_to_idx < year_prior) %>%
+      select(PatientICN, IndexDate, Code, CodeType) %>%
+      distinct() %>%
+      inner_join(mapping, by = c("Code", "CodeType")) %>%
+      select(PatientICN, IndexDate, Deficit) %>%
+      distinct()
+  }) %>%
+    bind_rows()
+}
+
+# Main VAFI function.
+# Returns a wide-format data frame: one row per PatientICN × IndexDate,
+# with columns vafi (score), one binary column per deficit, and a sentinel
+# 0 row for patient-years with no recorded deficits.
+make_vafi <- function(icds, prcd, index_date_tb,
+                      index_date_col = "year",
+                      year_prior     = 3L,
+                      chunk_size     = 1e6) {
+
+  index_date_tb[["IndexDate"]] <- as.numeric(index_date_tb[[index_date_col]])
+
+  icd_mapping  <- fst::read.fst(path_icd_map)
+  prcd_mapping <- fst::read.fst(path_prcd_map)
+
+  total_deficit <- length(unique(c(icd_mapping$Deficit, prcd_mapping$Deficit)))
+
+  icds_clean <- icds %>%
+    transmute(PatientICN, Code = ICDCode, CodeType = ICDCodeType, Date) %>%
+    .filter_icd_cutoff_years()
+
+  prcd_clean <- prcd %>%
+    transmute(PatientICN, Code = ProcedureCode, CodeType = ProcedureCodeType, Date) %>%
+    .filter_icd_cutoff_years()
+
+  cat("Ascertaining deficits from diagnosis codes...\n")
+  icd_deficits <- .make_deficit_chunk_years(
+    chunk_size, icds_clean, year_prior, index_date_tb, icd_mapping
+  )
+
+  cat("Ascertaining deficits from procedure codes...\n")
+  prcd_deficits <- .make_deficit_chunk_years(
+    chunk_size, prcd_clean, year_prior, index_date_tb, prcd_mapping
+  )
+
+  cat("Aggregating deficits and computing VAFI...\n")
+  dfct <- list(icd_deficits, prcd_deficits) %>%
+    bind_rows() %>%
+    distinct() %>%
+    group_by(PatientICN, IndexDate) %>%
+    mutate(
+      num_deficit = n(),
+      vafi        = num_deficit / total_deficit,
+      Value       = 1L
+    ) %>%
+    reshape2::dcast(PatientICN + IndexDate + vafi ~ Deficit,
+                    value.var = "Value") %>%
+    right_join(
+      index_date_tb %>% select(PatientICN, IndexDate),
+      by = c("PatientICN", "IndexDate")
+    ) %>%
+    mutate(vafi = if_else(is.na(vafi), 0, vafi))
+
+  dfct[is.na(dfct)] <- 0L
+  dfct
+}
+```
+
+---
+
+# Load Source Data
+
+## Patients
+
+One row per patient. Only the MRN is needed here; it is used to build the
+complete patient × year grid.
+
+```{r load-patients}
+patient_ids <- read.csv(path_patient) %>%
+  clean_names() %>%
+  transmute(PatientICN = mrn) %>%
+  distinct()
+
+cat("Unique patients:", nrow(patient_ids), "\n")
+```
+
+## Index-Date Grid
+
+A complete grid of every patient × index year for the study period.
+Each row represents one VAFI measurement occasion.
+
+```{r index-grid}
+index_date_tb <- patient_ids %>%
+  crossing(Date = study_years)
+
+cat("Index-date grid rows:", nrow(index_date_tb),
+    "(", n_distinct(index_date_tb$PatientICN), "patients ×",
+    length(study_years), "years)\n")
+```
+
+## Diagnosis Codes
+
+```{r load-diagnoses}
+icds <- read.csv(path_diagnosis) %>%
+  clean_names() %>%
+  transmute(
+    PatientICN  = mrn,
+    ICDCode     = icd10_code,
+    ICDCodeType = "ICD10",
+    Date        = as.integer(format(as.Date(diagnosis_date), "%Y"))
+  )
+
+cat("Diagnosis rows loaded:", nrow(icds), "\n")
+```
+
+## Procedure Codes
+
+```{r load-procedures}
+prcd <- read.csv(path_procedures) %>%
+  clean_names() %>%
+  transmute(
+    PatientICN        = mrn,
+    ProcedureCode     = cpt_code,
+    ProcedureCodeType = "CPT",
+    Date              = as.integer(format(as.Date(order_dttm), "%Y"))
+  )
+
+cat("Procedure rows loaded:", nrow(prcd), "\n")
+```
+
+---
+
+# Calculate VAFI
+
+For each patient × index year, deficits are ascertained from claims in the
+`year_prior` years before (and including) the index year.
+
+```{r calculate-vafi}
+vafi_year <- make_vafi(
+  icds           = icds,
+  prcd           = prcd,
+  index_date_tb  = index_date_tb,
+  index_date_col = "Date",
+  year_prior     = year_prior,
+  chunk_size     = chunk_size
+)
+
+cat("VAFI rows:", nrow(vafi_year), "\n")
+cat("Unique patients:", n_distinct(vafi_year$PatientICN), "\n")
+```
+
+## Add Deficit Count
+
+`deficit_count` is the sum of the 30 binary deficit columns. Patients with
+no coded deficits have a deficit count of 0 and a VAFI of 0.
+
+```{r add-deficit-count}
+
+# Add any deficits that were never observed (e.g. DuraMed) as zero columns
+missing_deficits <- setdiff(cols_deficit, names(vafi_year))
+vafi_year[missing_deficits] <- 0L
+
+vafi_year <- vafi_year %>%
+  mutate(
+    deficit_count = rowSums(
+      across(all_of(cols_deficit)),
+      na.rm = TRUE
+    )
+  )
+
+cat("Deficit count range:", min(vafi_year$deficit_count),
+    "-", max(vafi_year$deficit_count), "\n")
+cat("Mean deficit count :", round(mean(vafi_year$deficit_count), 2), "\n")
+```
+
+---
+
+# Validation
+
+```{r validate}
+cat("\n========== VALIDATION ==========\n")
+
+cat("Rows              :", nrow(vafi_year), "\n")
+cat("Unique patients   :", n_distinct(vafi_year$PatientICN), "\n")
+cat("Years covered     :", min(vafi_year$IndexDate), "-",
+                          max(vafi_year$IndexDate), "\n")
+
+cat("\nVAFI distribution:\n")
+print(summary(vafi_year$vafi))
+
+cat("\nDeficit count distribution:\n")
+print(summary(vafi_year$deficit_count))
+
+cat("\nPatients frail (VAFI > 0.2):",
+    sum(vafi_year$vafi > 0.2, na.rm = TRUE),
+    sprintf("(%.1f%%)", mean(vafi_year$vafi > 0.2, na.rm = TRUE) * 100), "\n")
+
+stopifnot(
+  "VAFI must be between 0 and 1"  = all(vafi_year$vafi >= 0 & vafi_year$vafi <= 1),
+  "No negative deficit counts"    = all(vafi_year$deficit_count >= 0),
+  "deficit_count consistent with vafi" =
+    all(abs(vafi_year$deficit_count / total_deficits - vafi_year$vafi) < 0.01 |
+        vafi_year$vafi == 0)
+)
+
+cat("All validation checks passed.\n")
+```
+
+---
+
+# Plots
+
+## Spaghetti Plot — VAFI Trajectories
+
+A random sample of 1 000 patients illustrates individual-level heterogeneity
+in frailty trajectories. The thick line shows the cohort mean.
+
+```{r plot-spaghetti, fig.width = 8, fig.height = 5}
+set.seed(42)
+sample_ids <- vafi_year %>%
+  distinct(PatientICN) %>%
+  slice_sample(n = 1000)
+
+vafi_sample <- vafi_year %>%
+  semi_join(sample_ids, by = "PatientICN")
+
+fig_trajectories <- ggplot(
+  vafi_sample,
+  aes(x = IndexDate, y = vafi, group = PatientICN)
+) +
+  geom_line(alpha = 0.15, colour = "steelblue") +
+  stat_summary(
+    aes(group = 1),
+    fun      = mean,
+    geom     = "line",
+    linewidth = 1.2,
+    colour   = "firebrick"
+  ) +
+  scale_x_continuous(breaks = study_years) +
+  labs(
+    title    = "VAFI trajectories — random sample of 1 000 patients",
+    subtitle = "Blue = individual; red = cohort mean",
+    x        = "Index year",
+    y        = "VAFI score"
+  ) +
+  theme_minimal()
+
+fig_trajectories
+```
+
+## Deficit Prevalence Bar Chart
+
+Shows how frequently each deficit was ascertained across all patient-years,
+ordered from most to least common.
+
+```{r plot-deficit-prevalence, fig.width = 8, fig.height = 6}
+deficit_prevalence <- vafi_year %>%
+  select(all_of(cols_deficit)) %>%
+  summarise(across(everything(), ~ sum(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(),
+               names_to  = "deficit",
+               values_to = "count")
+
+fig_deficits <- ggplot(
+  deficit_prevalence,
+  aes(x = reorder(deficit, count), y = count)
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Prevalence of each VAFI deficit (total patient-years)",
+    x     = "Deficit",
+    y     = "Count"
+  ) +
+  theme_minimal()
+
+fig_deficits
+```
+
+---
+
+# Save
+
+```{r save}
+saveRDS(vafi_year, path_output)
+
+cat("Saved:", path_output, "\n")
+cat("Rows  :", nrow(vafi_year), "\n")
+cat("Unique patients:", n_distinct(vafi_year$PatientICN), "\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

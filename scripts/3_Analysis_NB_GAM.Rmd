@@ -1,0 +1,595 @@
+---
+title: "3 — Bird Biodiversity and Frailty Severity: Negative Binomial GAM"
+author: "Pablo Knobel"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: united
+---
+
+# Summary
+
+This script estimates the longitudinal association between residential bird
+biodiversity (latent Shannon diversity index, IQR-scaled) and frailty severity
+(VAFI deficit count, 0–30) in a repeated-measures cohort of older adults
+receiving primary care at the Mount Sinai Health System.
+
+The primary model is a negative binomial GAM (`mgcv::bam`, `nb()` family)
+with a patient-level random intercept (`s(mrn, bs = "re")`), a penalised
+temporal smooth (`s(year)`), and time-varying Shannon as the exposure.
+Coefficients are exponentiated and reported as count ratios (CR); no offset
+is used, so results represent multiplicative changes in the absolute deficit
+count rather than a rate.
+
+Three sensitivity analyses are run:
+
+1. **Inverse-variance weighted** — downweights tract-years with high Shannon
+   prediction uncertainty (`shannon_weight = 1 / SE²`)
+2. **Restricted to ≥ 2 VAFI observations** — excludes patients observed only
+   once, who contribute no within-person information
+3. **3-year rolling mean Shannon** — replaces the annual estimate with a
+   3-year trailing mean to reduce year-to-year exposure noise
+
+Subgroup analyses stratify by age group, sex, race/ethnicity, and insurance.
+
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(mgcv)
+library(gratia)
+library(tibble)
+library(purrr)
+library(stringr)
+library(zoo)
+```
+
+```{r parameters}
+# --- Data path ---
+# --- Paths ---
+wd      <- "C:/Users/knobep01/OneDrive - The Mount Sinai Hospital"
+out_dir <- file.path(wd, "Knobel Lab", "Birds and Brains", "Birds Frailty - NYC", "outputs")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Automatically load the most recent analytical dataset
+data_dir  <- file.path(wd, "Knobel Lab", "Birds and Brains", "Birds Frailty - NYC")
+path_data <- tail(sort(list.files(
+  data_dir,
+  pattern = "^Birds_Frailty_Analytical_Dataset_.*\\.rds$",
+  full.names = TRUE
+)), 1)
+
+cat("Loading:", path_data, "\n")
+
+# --- Model parameters ---
+year_smooth_k    <- 7L    # Basis dimension for temporal smooth
+total_deficits   <- 30L   # Number of VAFI deficit items
+rolling_window   <- 3L    # Years for rolling-mean sensitivity analysis
+min_vafi_obs     <- 2L    # Minimum VAFI observations for restriction SA
+
+# --- Subgroup definitions ---
+# Each element: list(variable, label, reference level for factor)
+subgroup_specs <- list(
+  list(var = "age_group",           label = "Age group"),
+  list(var = "sex",                 label = "Sex"),
+  list(var = "race_collapsed",      label = "Race/ethnicity"),
+  list(var = "insurance_collapsed", label = "Insurance")
+)
+```
+
+---
+
+# Load and Prepare Data
+
+```{r load-data}
+df_raw <- readRDS(path_data)
+
+cat("Rows loaded     :", nrow(df_raw), "\n")
+cat("Unique patients :", n_distinct(df_raw$mrn), "\n")
+cat("Years covered   :", min(df_raw$year), "-", max(df_raw$year), "\n")
+```
+```{r}
+
+# Create a clean numeric patient ID for random effects
+# Avoids issues with non-numeric MRNs (e.g. "A" prefix)
+mrn_lookup <- df_raw %>%
+  distinct(mrn) %>%
+  mutate(patient_id = row_number())
+
+df_raw <- df_raw %>%
+  left_join(mrn_lookup, by = "mrn")
+
+cat("Unique patients    :", n_distinct(df_raw$patient_id), "\n")
+cat("Any NA patient_id  :", sum(is.na(df_raw$patient_id)), "\n")
+
+
+
+```
+
+## Prepare Model Dataset
+
+Complete-case restriction on the variables required for all models. The
+patient identifier `mrn` is converted to a factor, which is required by
+`mgcv` for the `bs = "re"` smooth.
+
+```{r prepare-model-data}
+df_model <- df_raw %>%
+  filter(
+    !is.na(deficit_count),
+    !is.na(shannon_pred_iqr),
+    !is.na(age),
+    !is.na(sex),
+    !is.na(race_collapsed),
+    !is.na(insurance_collapsed),
+    !is.na(pov_pct),
+    !is.na(nhblack_pct)
+  ) %>%
+  mutate(
+    mrn       = factor(mrn),
+    age_group = cut(age,
+                    breaks = c(-Inf, 64, 74, Inf),
+                    labels = c("< 65", "65–74", "≥ 75"),
+                    right  = TRUE)
+  ) %>%
+  arrange(mrn, year)
+
+cat("Model rows      :", nrow(df_model), "\n")
+cat("Unique patients :", n_distinct(df_model$mrn), "\n")
+
+cat("\n-- Overdispersion check --\n")
+cat("Mean deficit count :", round(mean(df_model$deficit_count), 2), "\n")
+cat("Var deficit count  :", round(var(df_model$deficit_count),  2), "\n")
+cat("Var/Mean ratio     :",
+    round(var(df_model$deficit_count) / mean(df_model$deficit_count), 2),
+    "(> 1 supports negative binomial over Poisson)\n")
+```
+
+## Add 3-Year Rolling Mean Shannon (Sensitivity Analysis 3)
+
+The rolling mean is computed within patient using a 3-year trailing window
+(`align = "right"`). Patient-years with fewer than 3 preceding observations
+are assigned `NA` and excluded from that sensitivity analysis.
+
+```{r rolling-mean-shannon}
+df_model <- df_model %>%
+  group_by(mrn) %>%
+  mutate(
+    shannon_3yr_mean = rollmeanr(shannon_pred_iqr, k = rolling_window,
+                                 fill = NA, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+cat("Patient-years with 3-year rolling mean:",
+    sum(!is.na(df_model$shannon_3yr_mean)), "\n")
+```
+
+---
+
+# Primary Model
+
+## Model Formula
+
+Time-varying Shannon enters as a linear parametric term. The temporal trend
+is captured by a penalised cubic regression spline, and patient clustering
+is handled by a random intercept smooth. No offset is used — results are
+therefore count ratios (CR), not incidence rate ratios.
+
+```{r primary-formula}
+formula_primary <- deficit_count ~
+  shannon_pred_iqr +
+  s(year, bs = "ps", k = year_smooth_k) +
+  age +
+  sex +
+  race_collapsed +
+  insurance_collapsed +
+  pov_pct +
+  nhblack_pct +
+  s(patient_id, bs = "re")
+  
+```
+
+## Fit
+
+`bam()` with `fREML` and `discrete = TRUE` is used for computational
+efficiency with the large patient random effect.
+
+```{r fit-primary, cache=TRUE}
+
+m_primary <- bam(
+  formula_primary,
+  family   = nb(),
+  data     = df_model,
+  method   = "fREML",
+  discrete = TRUE,
+  cluster  = cl
+)
+
+summary(m_primary)
+```
+
+## Extract Shannon Coefficient
+
+Coefficients are on the log scale; `exp()` converts to count ratios.
+A CR < 1 indicates fewer deficits (lower frailty severity) per 1-IQR
+increment in Shannon diversity.
+
+```{r extract-primary}
+extract_shannon_cr <- function(model, label) {
+  s         <- summary(model)
+  coef_row  <- s$p.table["shannon_pred_iqr", ]
+  estimate  <- coef_row["Estimate"]
+  se        <- coef_row["Std. Error"]
+  tibble(
+    model      = label,
+    cr         = exp(estimate),
+    ci_low     = exp(estimate - 1.96 * se),
+    ci_high    = exp(estimate + 1.96 * se),
+    pct_change = (exp(estimate) - 1) * 100,
+    p_value    = coef_row["Pr(>|t|)"]
+  )
+}
+
+results_primary <- extract_shannon_cr(m_primary, "Primary (time-varying Shannon)")
+print(results_primary)
+```
+
+---
+
+# Dose–Response Curve
+
+A partial effect plot for Shannon diversity on the response scale, holding
+all other covariates at their observed values (integrated marginal effect via
+`gratia::draw()`).
+
+```{r plot-shannon-smooth, fig.width = 7, fig.height = 4}
+# SA4: Nonlinear Shannon dose-response (for visualization only)
+m_sa4_nonlinear <- bam(
+  deficit_count ~
+    s(shannon_pred_iqr, bs = "tp", k = 5) +
+    s(year, bs = "ps", k = year_smooth_k) +
+    age +
+    sex +
+    race_collapsed +
+    insurance_collapsed +
+    pov_pct +
+    nhblack_pct +
+    s(mrn, bs = "re"),
+  family   = nb(),
+  data     = df_model,
+  method   = "fREML",
+  discrete = TRUE
+)
+
+fig_shannon_smooth <- draw(m_sa4_nonlinear, select = "s(shannon_pred_iqr)") +
+  labs(
+    title    = "Dose-response: Shannon diversity and VAFI deficit count",
+    subtitle = "Sensitivity analysis — nonlinear smooth; shaded = 95% CI",
+    x        = "Shannon diversity (IQR-scaled)",
+    y        = "Partial effect (log scale)"
+  ) +
+  theme_minimal()
+
+fig_shannon_smooth
+
+ggsave(
+  filename = file.path(out_dir, "fig_shannon_nonlinear.tiff"),
+  plot     = fig_shannon_smooth,
+  width    = 7, height = 4, dpi = 300, device = "tiff", bg = "white"
+)
+```
+
+## Temporal Trend
+
+```{r plot-year-smooth, fig.width = 7, fig.height = 4}
+fig_year_smooth <- draw(m_primary, select = "s(year)") +
+  labs(
+    title    = "Temporal trend in VAFI deficit count",
+    subtitle = "Penalised cubic regression spline; shaded = 95% CI",
+    x        = "Year",
+    y        = "Partial effect (log scale)"
+  ) +
+  theme_minimal()
+
+fig_year_smooth
+
+ggsave(
+  filename = file.path(out_dir, "fig_year_trend.tiff"),
+  plot     = fig_year_smooth,
+  width    = 7, height = 4, dpi = 300, device = "tiff", bg = "white"
+)
+```
+
+---
+
+# Sensitivity Analyses
+
+## SA 1 — Inverse-Variance Weighted
+
+Downweights tract-years where the Shannon GAM prediction had high uncertainty.
+`discrete = FALSE` is required when user-supplied weights are passed to `bam()`.
+
+```{r sa1-weighted, cache=TRUE}
+m_sa1_weighted <- gam(
+  formula_primary,
+  family   = nb(),
+  weights  = shannon_weight,
+  data     = df_model,
+  method   = "fREML",
+  discrete = FALSE
+)
+
+results_sa1 <- extract_shannon_cr(m_sa1_weighted,
+                                   "SA1: Inverse-variance weighted")
+print(results_sa1)
+```
+
+## SA 2 — Restricted to ≥ 2 VAFI Observations
+
+Patients observed only once cannot contribute within-person variation to the
+random intercept. Restricting to ≥ 2 observations confirms that results are
+not driven by single-observation patients.
+
+```{r sa2-restricted, cache=TRUE}
+mrn_multi_obs <- df_model %>%
+  group_by(mrn) %>%
+  summarise(n_obs = n(), .groups = "drop") %>%
+  filter(n_obs >= min_vafi_obs) %>%
+  pull(mrn)
+
+df_sa2 <- df_model %>%
+  filter(mrn %in% mrn_multi_obs) %>%
+  mutate(mrn = droplevels(mrn))
+
+cat("Patients in SA2 (≥", min_vafi_obs, "obs):", n_distinct(df_sa2$mrn), "\n")
+cat("Rows in SA2                           :", nrow(df_sa2), "\n")
+
+m_sa2_restricted <- bam(
+  formula_primary,
+  family   = nb(),
+  data     = df_sa2,
+  method   = "fREML",
+  discrete = TRUE,
+  nthreads = max(1L, parallel::detectCores() - 1L)
+)
+
+results_sa2 <- extract_shannon_cr(m_sa2_restricted,
+                                   paste0("SA2: Restricted to ≥",
+                                          min_vafi_obs, " VAFI obs"))
+print(results_sa2)
+```
+
+## SA 3 — 3-Year Rolling Mean Shannon
+
+Replaces the annual Shannon estimate with a 3-year trailing mean to reduce
+year-to-year measurement noise in the exposure.
+
+```{r sa3-rolling, cache=TRUE}
+formula_sa3 <- update(formula_primary, . ~ . - shannon_pred_iqr + shannon_3yr_mean)
+
+df_sa3 <- df_model %>%
+  filter(!is.na(shannon_3yr_mean)) %>%
+  mutate(mrn = droplevels(mrn))
+
+cat("Rows in SA3 (3-yr rolling mean available):", nrow(df_sa3), "\n")
+
+m_sa3_rolling <- gam(
+  formula_sa3,
+  family   = nb(),
+  data     = df_sa3,
+  method   = "fREML",
+  discrete = TRUE,
+  nthreads = max(1L, parallel::detectCores() - 1L)
+)
+
+# Extract using shannon_3yr_mean coefficient
+extract_rolling_cr <- function(model, label) {
+  s        <- summary(model)
+  coef_row <- s$p.table["shannon_3yr_mean", ]
+  estimate <- coef_row["Estimate"]
+  se       <- coef_row["Std. Error"]
+  tibble(
+    model      = label,
+    cr         = exp(estimate),
+    ci_low     = exp(estimate - 1.96 * se),
+    ci_high    = exp(estimate + 1.96 * se),
+    pct_change = (exp(estimate) - 1) * 100,
+    p_value    = coef_row["Pr(>|t|)"]
+  )
+}
+
+results_sa3 <- extract_rolling_cr(m_sa3_rolling, "SA3: 3-year rolling mean Shannon")
+print(results_sa3)
+```
+
+## Sensitivity Results Table
+
+```{r sa-results-table}
+results_all <- bind_rows(
+  results_primary,
+  results_sa1,
+  results_sa2,
+  results_sa3
+) %>%
+  mutate(
+    across(c(cr, ci_low, ci_high), ~ round(.x, 3)),
+    pct_change = round(pct_change, 1),
+    p_value    = round(p_value, 4),
+    result     = sprintf("CR %.3f (%.3f–%.3f), p = %.4f",
+                         cr, ci_low, ci_high, p_value)
+  )
+
+print(results_all %>% select(model, result, pct_change))
+```
+
+---
+
+# Subgroup Analyses
+
+Each subgroup is fit separately using the same primary model formula, but
+with covariates that become single-level within a stratum removed
+automatically. Results are pooled into a forest plot.
+
+```{r subgroup-function}
+# Fit the primary model within one stratum, dropping any covariate that has
+# only one unique non-NA level (which would cause rank deficiency).
+fit_stratum <- function(data, stratum_var, stratum_level) {
+
+  df_sub <- data %>%
+    filter(.data[[stratum_var]] == stratum_level) %>%
+    mutate(mrn = droplevels(mrn))
+
+  if (nrow(df_sub) < 50L || n_distinct(df_sub$mrn) < 10L) {
+    return(NULL)   # too few observations to fit reliably
+  }
+
+  # Remove the stratification variable and any single-level covariates
+  single_level_vars <- c(stratum_var,
+    names(which(sapply(
+      df_sub %>% select(sex, race_collapsed, insurance_collapsed, age_group),
+      function(x) length(unique(na.omit(x))) < 2L
+    )))
+  )
+
+  rhs_terms <- labels(terms(formula_primary))
+  rhs_clean <- rhs_terms[!str_detect(rhs_terms,
+                          paste(single_level_vars, collapse = "|"))]
+  formula_sub <- as.formula(
+    paste("deficit_count ~", paste(rhs_clean, collapse = " + "))
+  )
+
+  tryCatch({
+    m <- bam(
+      formula_sub,
+      family   = nb(),
+      data     = df_sub,
+      method   = "fREML",
+      discrete = TRUE,
+      nthreads = max(1L, parallel::detectCores() - 1L)
+    )
+    extract_shannon_cr(m, paste0(stratum_var, ": ", stratum_level)) %>%
+      mutate(
+        subgroup_var   = stratum_var,
+        subgroup_level = stratum_level,
+        n_rows         = nrow(df_sub),
+        n_patients     = n_distinct(df_sub$mrn)
+      )
+  }, error = function(e) {
+    message("Model failed for ", stratum_var, " = ", stratum_level, ": ", e$message)
+    NULL
+  })
+}
+```
+
+```{r run-subgroups, cache=TRUE}
+subgroup_vars <- c("age_group", "sex", "race_collapsed", "insurance_collapsed")
+
+subgroup_results <- map_dfr(
+  subgroup_vars,
+  function(var) {
+    levels_var <- unique(na.omit(df_model[[var]]))
+    map_dfr(levels_var, ~ fit_stratum(df_model, var, as.character(.x)))
+  }
+)
+
+print(subgroup_results %>%
+  select(subgroup_var, subgroup_level, n_patients, cr, ci_low, ci_high, p_value))
+```
+
+## Subgroup Forest Plot
+
+```{r forest-plot, fig.width = 8, fig.height = 6}
+subgroup_labels <- tibble(
+  subgroup_var = c("age_group", "sex", "race_collapsed", "insurance_collapsed"),
+  var_label    = c("Age group", "Sex", "Race/ethnicity", "Insurance")
+)
+
+plot_data <- subgroup_results %>%
+  left_join(subgroup_labels, by = "subgroup_var") %>%
+  mutate(
+    label      = paste0(var_label, ": ", subgroup_level),
+    label      = factor(label, levels = rev(unique(label))),
+    sig        = p_value < 0.05
+  )
+
+fig_forest <- ggplot(plot_data,
+                     aes(x = pct_change, y = label, colour = sig)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(
+    aes(xmin = (ci_low  - 1) * 100,
+        xmax = (ci_high - 1) * 100),
+    height = 0.3
+  ) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(
+    values = c("TRUE" = "#B22222", "FALSE" = "#333333"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "Subgroup analysis: Shannon diversity and VAFI deficit count",
+    subtitle = "Count ratio per 1-IQR increment in Shannon; error bars = 95% CI",
+    x        = "% change in deficit count per 1-IQR Shannon",
+    y        = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+
+fig_forest
+
+ggsave(
+  filename = file.path(out_dir, "fig_subgroup_forest.tiff"),
+  plot     = fig_forest,
+  width    = 8, height = 6, dpi = 300, device = "tiff", bg = "white"
+)
+```
+
+---
+
+# Model Diagnostics
+
+```{r diagnostics, fig.width = 8, fig.height = 6}
+# gam.check produces 4 diagnostic plots and prints basis dimension adequacy
+gam.check(m_primary)
+```
+
+Concurvity between smooth terms (analogous to multicollinearity):
+
+```{r concurvity}
+concurvity(m_primary, full = FALSE)
+```
+
+---
+
+# Summary Table
+
+```{r summary-table}
+results_summary <- results_all %>%
+  select(model, cr, ci_low, ci_high, pct_change, p_value)
+
+cat("\n===== PRIMARY AND SENSITIVITY ANALYSIS RESULTS =====\n")
+print(results_summary, n = Inf)
+cat("\nInterpretation: CR < 1 = fewer deficits per 1-IQR higher Shannon.\n")
+cat("pct_change = (CR - 1) × 100 = % difference in deficit count.\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

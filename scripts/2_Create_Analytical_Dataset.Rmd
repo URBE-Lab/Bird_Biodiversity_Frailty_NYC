@@ -375,26 +375,26 @@ df_alive <- df_alive %>%
     age              = year - year(dob),
     vafi_bi          = as.integer(!is.na(vafi) & vafi > 0.2),
     shannon_pred_iqr = shannon_pred / shannon_iqr,
-    race_collapsed   = case_when(
-      race %in% c("White", "WHITE")                 ~ "White",
-      race %in% c("Black or African American",
-                  "BLACK OR AFRICAN AMERICAN")       ~ "Black",
-      race %in% c("Asian", "ASIAN")                 ~ "Asian",
-      race %in% c("Hispanic", "HISPANIC OR LATINO") ~ "Hispanic",
-      TRUE                                           ~ "Other/Unknown"
+    race_collapsed = case_when(
+      race == "White"                              ~ "White",
+      race == "Black or African-American"          ~ "Black",
+      race == "ASIAN"                              ~ "Asian",
+      race %in% c("American Indian or Alaska Native",
+                  "Native Hawaiian or Pacific Islander",
+                  "Other")                         ~ "Other",
+      TRUE                                         ~ "Other"
     ),
-    race_collapsed      = factor(race_collapsed,
-                                 levels = c("White", "Black", "Asian",
-                                            "Hispanic", "Other/Unknown")),
+    race_collapsed = factor(race_collapsed,
+                            levels = c("White", "Black", "Asian", "Other")),
     insurance_collapsed = case_when(
       grepl("Medicare",        insurance, ignore.case = TRUE) ~ "Medicare",
       grepl("Medicaid",        insurance, ignore.case = TRUE) ~ "Medicaid",
       grepl("Commercial|Private", insurance, ignore.case = TRUE) ~ "Commercial",
-      TRUE                                                    ~ "Other/Unknown"
+      TRUE                                                    ~ "Other"
     ),
     insurance_collapsed = factor(insurance_collapsed,
                                  levels = c("Commercial", "Medicare",
-                                            "Medicaid", "Other/Unknown"))
+                                            "Medicaid", "Other"))
   )
 
 cat("IQR of shannon_pred used for scaling:", round(shannon_iqr, 3), "\n")

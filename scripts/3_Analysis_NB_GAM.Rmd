@@ -91,7 +91,7 @@ cat("Deficits in mapping files:", length(cols_deficit), "\n")
 year_smooth_k  <- 7L    # Basis dimension for temporal smooth
 total_deficits <- 31L   # Number of VAFI deficit items
 rolling_window <- 3L    # Years for rolling-mean sensitivity analysis
-sa3_year_min   <- 2015L # Start year for SA3
+sa2_year_min   <- 2015L # Start year for SA3
 ```
 
 ---
@@ -334,15 +334,14 @@ ggsave(
 ```
 
 ---
-
-# Sensitivity Analyses
+## Sensitivity Analyses
 
 All sensitivity analyses use inverse-variance weighting.
 
-## SA1 — 3-Year Rolling Mean Shannon
+### SA1 — 3-Year Rolling Mean Shannon
 
 Replaces the annual Shannon estimate with a 3-year trailing mean to reduce
-year-to-year measurement noise.
+year-to-year measurement noise in the exposure.
 
 ```{r sa1-rolling, cache=TRUE}
 formula_sa1 <- update(formula_primary,
@@ -364,94 +363,67 @@ m_sa1_rolling <- gam(
 results_sa1 <- extract_shannon_cr(m_sa1_rolling,
                                    "SA1: 3-year rolling mean Shannon (IVW)",
                                    coef_name = "shannon_3yr_mean")
-print(results_sa1)
 ```
 
-## SA2 — Nonlinear Shannon Dose-Response
-
-Shannon enters as a smooth term to assess non-linearity. The patient random
-effect is dropped as it suppresses the between-person Shannon signal when
-fitted jointly with the smooth. This model captures both within- and
-between-person dose-response.
-
-```{r sa2-nonlinear, cache=TRUE}
-formula_sa2 <- deficit_count ~
-  s(shannon_pred_iqr, bs = "tp", k = 5) +
-  s(year, bs = "ps", k = year_smooth_k) +
-  age +
-  sex +
-  race_collapsed +
-  insurance_collapsed +
-  pov_pct +
-  nhblack_pct
-
-m_sa2_nonlinear <- gam(
-  formula_sa2,
-  family  = nb(),
-  weights = shannon_weight,
-  data    = df_model,
-  method  = "REML"
-)
-
-fig_shannon_smooth <- draw(m_sa2_nonlinear,
-                           select = "s(shannon_pred_iqr)") +
-  labs(
-    title    = "Dose-response: Shannon diversity and VAFI deficit count",
-    subtitle = "SA2 — nonlinear smooth, IVW; shaded = 95% CI",
-    x        = "Shannon diversity (IQR-scaled)",
-    y        = "Partial effect (log scale)"
-  ) +
-  theme_minimal()
-
-fig_shannon_smooth
-
-ggsave(
-  filename = file.path(out_dir, "fig_shannon_nonlinear.tiff"),
-  plot     = fig_shannon_smooth,
-  width    = 7, height = 4, dpi = 300, device = "tiff", bg = "white"
-)
-```
-
-## SA3 — Restricted to 2015 Onward
+### SA2 — Restricted to 2015 Onward
 
 The temporal trend suggests potential data quality issues before 2015.
 This analysis confirms robustness to exclusion of the early period.
 
-```{r sa3-post2015, cache=TRUE}
-df_sa3 <- df_model %>%
-  filter(year >= sa3_year_min)
+```{r sa2-post2015, cache=TRUE}
+df_sa2 <- df_model %>%
+  filter(year >= sa2_year_min)
 
-cat("Rows in SA3 (≥ 2015):", nrow(df_sa3), "\n")
-cat("Unique patients      :", n_distinct(df_sa3$patient_id), "\n")
+cat("Rows in SA2 (≥ 2015):", nrow(df_sa2), "\n")
+cat("Unique patients      :", n_distinct(df_sa2$patient_id), "\n")
 
-m_sa3_post2015 <- gam(
+m_sa2_post2015 <- gam(
   formula_primary,
   family  = nb(),
   weights = shannon_weight,
-  data    = df_sa3,
+  data    = df_sa2,
   method  = "REML"
 )
 
-results_sa3 <- extract_shannon_cr(m_sa3_post2015,
-                                   "SA3: Restricted to 2015 onward (IVW)")
-print(results_sa3)
+results_sa2 <- extract_shannon_cr(m_sa2_post2015,
+                                   "SA2: Restricted to 2015 onward (IVW)")
 ```
 
-## Sensitivity Results Table
+### Sensitivity Results Table
 
 ```{r sa-results-table}
-results_sa <- bind_rows(results_primary, results_sa1, results_sa3) %>%
+results_sa <- bind_rows(results_primary, results_sa1, results_sa2) %>%
   mutate(
-    across(c(cr, ci_low, ci_high), ~ round(.x, 3)),
-    pct_change = round(pct_change, 1),
-    p_value    = round(p_value, 4),
-    result     = sprintf("CR %.3f (%.3f–%.3f), p = %.4f",
-                         cr, ci_low, ci_high, p_value)
+    `% change (95% CI)` = sprintf("%.1f%% (%.1f%% to %.1f%%)",
+                                   pct_change,
+                                   (ci_low  - 1) * 100,
+                                   (ci_high - 1) * 100),
+    `p-value` = ifelse(p_value < 0.001, "< 0.001",
+                       sprintf("%.3f", p_value))
+  ) %>%
+  select(
+    `Model`             = model,
+    `% change (95% CI)`,
+    `p-value`
   )
 
-cat("\n===== SENSITIVITY ANALYSIS RESULTS =====\n")
-print(results_sa %>% select(model, result, pct_change), n = Inf)
+sa_ft <- flextable(results_sa) %>%
+  autofit() %>%
+  theme_booktabs() %>%
+  bold(part = "header") %>%
+  add_footer_lines("% change in VAFI deficit count per 1-IQR increment in Shannon diversity. IVW = inverse-variance weighted.")
+
+doc <- read_docx() %>%
+  body_add_par(
+    "Table 3. Primary and sensitivity analysis results",
+    style = "heading 1"
+  ) %>%
+  body_add_flextable(sa_ft)
+
+print(doc, target = file.path(out_dir, "table3_sensitivity.docx"))
+cat("Table 3 saved.\n")
 ```
+
 
 ---
 
@@ -526,6 +498,39 @@ interaction_results <- map_dfr(age_groups, function(ag) {
 
 print(interaction_results)
 
+interaction_table <- interaction_results %>%
+  mutate(
+    `% change (95% CI)` = sprintf("%.1f%% (%.1f%% to %.1f%%)",
+                                   pct_change,
+                                   (ci_low  - 1) * 100,
+                                   (ci_high - 1) * 100),
+    `Count Ratio (95% CI)` = sprintf("%.3f (%.3f–%.3f)",
+                                      cr, ci_low, ci_high),
+    `p-value` = ifelse(p_value < 0.001, "< 0.001",
+                       sprintf("%.3f", p_value))
+  ) %>%
+  select(
+    `Age group`            = age_group,
+    `Count Ratio (95% CI)`,
+    `% change (95% CI)`,
+    `p-value`
+  )
+
+interaction_ft <- flextable(interaction_table) %>%
+  autofit() %>%
+  theme_booktabs() %>%
+  bold(part = "header") %>%
+  add_footer_lines("CR: count ratio per 1-IQR increment in Shannon diversity (IVW model). % change = (CR − 1) × 100.")
+
+doc <- read_docx() %>%
+  body_add_par(
+    "Table 2. Shannon diversity and VAFI deficit count by age group",
+    style = "heading 1"
+  ) %>%
+  body_add_flextable(interaction_ft)
+
+print(doc, target = file.path(out_dir, "table2_age_interaction.docx"))
+cat("Table 2 saved.\n")
 ```
 
 
